@@ -1,25 +1,24 @@
 #!/usr/bin/env python
 
 import argparse
-import base64
 import configparser
 import datetime
-import decimal
-from distutils.command.config import config
 import json
-import math
 import sys
 import time
-from decimal import Decimal
-
+import uuid
 import boto3
-import cbpro
+from decimal import Decimal
+from coinbase.rest import RESTClient
+from json import dumps
 
 
 def get_timestamp():
     ts = time.time()
     return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
+def generate_client_order_id():
+    return str(uuid.uuid4())
 
 """
     Basic Coinbase Pro DCA buy/sell bot that executes a market order.
@@ -77,7 +76,7 @@ parser.add_argument(
 
 parser.add_argument(
     "-warn_after",
-    default=300,
+    default=30,
     action="store",
     type=int,
     dest="warn_after",
@@ -107,7 +106,7 @@ def main(event, context):
     attributes = event.get("attributes", {})
 
     market_name = attributes.get("market_name", args.market_name)
-    order_side = attributes.get("order_side", args.order_side).lower()
+    order_side = attributes.get("order_side", args.order_side)
     amount = Decimal(attributes.get("amount", args.amount))
     amount_currency = attributes.get("amount_currency", args.amount_currency)
     config_file = attributes.get("config_file", args.config_file)
@@ -138,103 +137,93 @@ def main(event, context):
             exit()
 
     # Read settings
+    print(f"Reading config file: {config_file}")
     config = configparser.ConfigParser()
     config.read(config_file)
-
-    config_section = "production"
-    if sandbox_mode:
-        config_section = "sandbox"
+    config_section = "production" 
+    
     key = config.get(config_section, "API_KEY")
-    passphrase = config.get(config_section, "PASSPHRASE")
     secret = config.get(config_section, "SECRET_KEY")
     sns_topic = config.get(config_section, "SNS_TOPIC")
-
-    # Instantiate public and auth API clients
-    if not args.sandbox_mode:
-        auth_client = cbpro.AuthenticatedClient(key, secret, passphrase)
-    else:
-        # Use the sandbox API (requires a different set of API access credentials)
-        auth_client = cbpro.AuthenticatedClient(
-            key,
-            secret,
-            passphrase,
-            api_url="https://api-public.sandbox.pro.coinbase.com",
-        )
-
-    public_client = cbpro.PublicClient()
-
-    # Retrieve dict list of all trading pairs
-    products = public_client.get_products()
-    base_min_size = None
-    base_increment = None
-    quote_increment = None
-    for product in products:
-        if product.get("id") == market_name:
-            base_currency = product.get("base_currency")
-            quote_currency = product.get("quote_currency")
-            base_min_size = Decimal(product.get("base_min_size")).normalize()
-            base_increment = Decimal(product.get("base_increment")).normalize()
-            quote_increment = Decimal(product.get("quote_increment")).normalize()
-            if amount_currency == product.get("quote_currency"):
-                amount_currency_is_quote_currency = True
-            elif amount_currency == product.get("base_currency"):
-                amount_currency_is_quote_currency = False
-            else:
-                raise Exception(
-                    f"amount_currency {amount_currency} not in market {market_name}"
-                )
-            print(json.dumps(product, indent=2))
-
-    print(f"base_min_size: {base_min_size}")
-    print(f"quote_increment: {quote_increment}")
 
     # Prep boto SNS client for email notifications
     sns = boto3.client('sns')
 
-    if amount_currency_is_quote_currency:
-        result = auth_client.place_market_order(
-            product_id=market_name,
-            side=order_side,
-            funds=float(amount.quantize(quote_increment)),
-        )
+    # Instantiate public and auth API clients
+    client = RESTClient(api_key=key, api_secret=secret, timeout=5)
+
+    # Get product info
+    product = client.get_product(market_name)
+    
+    # Get product info and setup quote and base currency
+    base_currency = product.base_currency_id
+    quote_currency = product.quote_currency_id
+    base_min_size = Decimal(product.base_min_size).normalize()
+    base_increment = Decimal(product.base_increment).normalize()
+    quote_increment = Decimal(product.quote_increment).normalize()
+    if amount_currency == product.quote_currency_id:
+        amount_currency_is_quote_currency = True
+    elif amount_currency == product.base_currency_id:
+        amount_currency_is_quote_currency = False
     else:
-        result = auth_client.place_market_order(
-            product_id=market_name,
-            side=order_side,
-            size=float(amount.quantize(base_increment)),
+        raise Exception(
+            f"amount_currency {amount_currency} not in market {market_name}"
         )
-
-    print(json.dumps(result, sort_keys=True, indent=4))
-
-    if "message" in result:
-        # Something went wrong if there's a 'message' field in response
+    
+    print(f"product: {product}")
+    print(f"base_min_size: {base_min_size}")
+    print(f"quote_increment: {quote_increment}")
+ 
+    quote_size = str(amount.quantize(base_increment))
+    print(f"quote_size: {quote_size}")
+    print(f"order_side: {order_side}")
+    # Put a buy order in
+    if order_side == "BUY":
+        order = client.market_order_buy(client_order_id=generate_client_order_id(), product_id=market_name, quote_size=quote_size)
+        print(dumps(order.to_dict(), indent=2))
+    else: # Currently only supports buy orders
+        exit()
+    
+    if "message" in order.to_dict():
+    #     # Something went wrong if there's a 'message' field in response
         sns.publish(
             TopicArn=sns_topic,
             Subject=f"Could not place {market_name} {order_side} order",
-            Message=json.dumps(result, sort_keys=True, indent=4),
+            Message=order,
         )
         exit()
 
-    if result and "status" in result and result["status"] == "rejected":
-        print(f"{get_timestamp()}: {market_name} Order rejected")
+    if order and "error_response" in order.to_dict():
+        print(f"{get_timestamp()}: {market_name} Order Error")
 
-    order = result
-    order_id = order["id"]
+    # Get Order details to check status
+    order_id = order["success_response"]["order_id"]
+    client_order_id = order["success_response"]["client_order_id"]
     print(f"order_id: {order_id}")
+    print(f"client_order_id: {client_order_id}")
 
-    """
-        Wait to see if the order was fulfilled.
-    """
+    # Check if the order is still open or unfilled
     wait_time = 5
     total_wait_time = 0
-    while "status" in order and (
-        order["status"] == "pending" or order["status"] == "open"
-    ):
+
+    # Allow time for the order to be processed
+    time.sleep(wait_time)
+
+    order_response = client.get_order(order_id)
+    print(f"Response: {order_response}")
+
+    order = order_response.order
+    print(f'Order: {order}')
+    print(f"Status: {order['status']}")
+    
+   
+    while order['status'] in ['OPEN', 'PENDING', 'UNKNOWN_ORDER_STATUS']:
+
         if total_wait_time > warn_after:
             sns.publish(
                 TopicArn=sns_topic,
                 Subject=f"{market_name} {order_side} order of {amount} {amount_currency} OPEN/UNFILLED",
-                Message=json.dumps(order, sort_keys=True, indent=4),
+                Message=order,
             )
             exit()
 
@@ -243,33 +232,37 @@ def main(event, context):
         )
         time.sleep(wait_time)
         total_wait_time += wait_time
-        order = auth_client.get_order(order_id)
-        # print(json.dumps(order, sort_keys=True, indent=4))
-
-        if "message" in order and order["message"] == "NotFound":
+        order_response = client.get_order(order_id)
+        order = order_response.order
+        
+        if (order["cancel_message"] or  order["reject_message"]) and \
+                (order["status"] not in ['OPEN', 'FILLED', 'UNKNOWN_ORDER_STATUS']):
             # Most likely the order was manually cancelled in the UI
+
             sns.publish(
                 TopicArn=sns_topic,
-                Subject=f"{market_name} {order_side} order of {amount} {amount_currency} CANCELLED",
-                Message=json.dumps(result, sort_keys=True, indent=4),
+                Subject=f"{market_name} {order_side} order of {amount} {amount_currency} CANCELLED/REJECTED",
+                Message=order,
             )
             exit()
-
+    
     # Order status is no longer pending!
-    print(json.dumps(order, indent=2))
+    print('Printing the order')
+    print(f"order: {order}")
+    print(order)
+    
 
-    market_price = (
-        Decimal(order["executed_value"]) / Decimal(order["filled_size"])
-    ).quantize(quote_increment)
+    market_price = Decimal(order.average_filled_price).quantize(quote_increment)
 
     subject = f"{market_name} {order_side} order of {amount} {amount_currency} {order['status']} @ {market_price} {quote_currency}"
     print(subject)
     sns.publish(
         TopicArn=sns_topic,
         Subject=subject,
-        Message=json.dumps(order, sort_keys=True, indent=4),
+        Message=order
     )
 
+    
     return {
         'statusCode': 200,
         'body': json.dumps("BTCBOT Job Ended!")

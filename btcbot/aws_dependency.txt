@@ -1,1 +1,1 @@
-cbpro==1.1.4
+coinbase-advanced-py
