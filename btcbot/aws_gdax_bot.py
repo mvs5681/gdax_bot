@@ -189,7 +189,7 @@ def main(event, context):
         sns.publish(
             TopicArn=sns_topic,
             Subject=f"Could not place {market_name} {order_side} order",
-            Message=order,
+            Message=json.dumps(order.to_dict(), sort_keys=True, indent=4)
         )
         exit()
 
@@ -223,7 +223,7 @@ def main(event, context):
             sns.publish(
                 TopicArn=sns_topic,
                 Subject=f"{market_name} {order_side} order of {amount} {amount_currency} OPEN/UNFILLED",
-                Message=order,
+                Message=json.dumps(order.to_dict(), sort_keys=True, indent=4)
             )
             exit()
 
@@ -242,7 +242,7 @@ def main(event, context):
             sns.publish(
                 TopicArn=sns_topic,
                 Subject=f"{market_name} {order_side} order of {amount} {amount_currency} CANCELLED/REJECTED",
-                Message=order,
+                Message=json.dumps(order.to_dict(), sort_keys=True, indent=4)
             )
             exit()
     
@@ -259,7 +259,7 @@ def main(event, context):
     sns.publish(
         TopicArn=sns_topic,
         Subject=subject,
-        Message=order
+        Message=json.dumps(order.to_dict(), sort_keys=True, indent=4)
     )
 
     
